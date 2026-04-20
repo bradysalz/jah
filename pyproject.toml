@@ -2,7 +2,7 @@
 name = "jah"
 version = "0.1.0"
 description = "Terminal UI for markdown ticket visualization."
-readme = "SPEC.md"
+readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "pyperclip>=1.8.2",

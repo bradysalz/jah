@@ -191,6 +191,11 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Local agent state
+.codex
+.beans.yml
+.beans/
+
 # PyPI configuration file
 .pypirc
 
