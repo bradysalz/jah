@@ -125,8 +125,10 @@ def tree_rows(
     query: str = "",
     hide_done: bool = False,
     expanded_ids: Optional[Set[str]] = None,
+    visible_statuses: Optional[Set[str]] = None,
 ) -> List[Tuple[str, int, bool, bool]]:
     candidate_ids = _tree_candidate_ids(graph, query)
+    candidate_ids = _apply_tree_status_filter(graph, candidate_ids, visible_statuses)
     if hide_done:
         candidate_ids = _apply_tree_done_filter(graph, candidate_ids)
 
@@ -148,10 +150,18 @@ def tree_rows(
     return rows
 
 
-def kanban_columns(graph: TicketGraph, query: str = "", hide_done: bool = False) -> Dict[str, List[str]]:
+def kanban_columns(
+    graph: TicketGraph,
+    query: str = "",
+    hide_done: bool = False,
+    visible_statuses: Optional[Set[str]] = None,
+) -> Dict[str, List[str]]:
     columns = {column: [] for column in KANBAN_COLUMNS}
+    allowed_statuses = visible_statuses if visible_statuses is not None else VALID_STATUSES
     for ticket_id, ticket in graph.tickets.items():
         if not graph.is_leaf(ticket_id):
+            continue
+        if ticket.status not in allowed_statuses:
             continue
         if hide_done and ticket.is_done:
             continue
@@ -193,6 +203,23 @@ def _apply_tree_done_filter(graph: TicketGraph, candidate_ids: Set[str]) -> Set[
         ticket = graph.ticket(ticket_id)
         if not ticket.is_done or has_active_visible_descendant(ticket_id):
             visible.add(ticket_id)
+    return visible
+
+
+def _apply_tree_status_filter(
+    graph: TicketGraph,
+    candidate_ids: Set[str],
+    visible_statuses: Optional[Set[str]],
+) -> Set[str]:
+    allowed_statuses = visible_statuses if visible_statuses is not None else VALID_STATUSES
+    if allowed_statuses == VALID_STATUSES:
+        return candidate_ids
+
+    visible: Set[str] = set()
+    for ticket_id in candidate_ids:
+        if graph.ticket(ticket_id).status in allowed_statuses:
+            visible.add(ticket_id)
+            visible.update(ancestor_id for ancestor_id in graph.ancestors(ticket_id) if ancestor_id in candidate_ids)
     return visible
 
 

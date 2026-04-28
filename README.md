@@ -16,10 +16,10 @@ enough for any flat directory of markdown files with YAML frontmatter.
 - Kanban view for leaf tickets
 - Live search across title, tags, and body
 - Hide-done filtering
-- Detail pane for the selected ticket
+- Detail preview pane plus a scrollable detail modal on `Enter`
 - `$EDITOR` integration for external editing
 - Clipboard copy for selected ticket IDs
-- Keyboard help and kanban column toggles
+- Keyboard help, status filtering, and kanban column toggles
 
 ## Install
 
@@ -46,11 +46,12 @@ If no path is passed, `jah` reads tickets from the current directory.
 - `Esc`: clear search
 - `?`: help
 - `c`: choose visible kanban columns
+- `s`: filter visible statuses
 - `d`: toggle hide done
 - `r`: refresh
 - `y`: copy selected ticket ID
 - `e`: edit selected ticket in `$EDITOR`
-- `Enter`: show selected ticket details
+- `Enter`: open selected ticket detail modal
 
 ## Development
 

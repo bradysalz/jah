@@ -176,3 +176,27 @@ def test_hide_done_filters_done_kanban_cards(tmp_path: Path) -> None:
 
     assert columns["TODO"] == ["todo"]
     assert columns["DONE"] == []
+
+
+def test_tree_status_filter_keeps_matching_nodes_and_ancestors(tmp_path: Path) -> None:
+    write_ticket(tmp_path, "root", "Root", status="todo")
+    write_ticket(tmp_path, "active", "Active", status="in-progress", parent="root")
+    write_ticket(tmp_path, "done", "Done", status="completed", parent="root")
+
+    graph = load_graph(tmp_path)
+    rows = tree_rows(graph, visible_statuses={"in-progress"})
+
+    assert [row[0] for row in rows] == ["root", "active"]
+
+
+def test_kanban_status_filter_limits_visible_cards(tmp_path: Path) -> None:
+    write_ticket(tmp_path, "todo", "Todo", status="todo")
+    write_ticket(tmp_path, "wip", "Wip", status="in-progress")
+    write_ticket(tmp_path, "done", "Done", status="completed")
+
+    graph = load_graph(tmp_path)
+    columns = kanban_columns(graph, visible_statuses={"in-progress", "completed"})
+
+    assert columns["TODO"] == []
+    assert columns["WIP"] == ["wip"]
+    assert columns["DONE"] == ["done"]
