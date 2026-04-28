@@ -4,20 +4,28 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
 from rich.console import Group
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
+from textual.containers import Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.events import Key
 from textual.screen import ModalScreen
 from textual.widgets import Footer, Header, Input, Static
 
-from jah.models import KANBAN_COLUMNS, Ticket, TicketGraph, all_expanded_ids, kanban_columns, tree_rows
+from jah.models import (
+    KANBAN_COLUMNS,
+    VALID_STATUSES,
+    Ticket,
+    TicketGraph,
+    all_expanded_ids,
+    kanban_columns,
+    tree_rows,
+)
 from jah.parser import load_graph
 
 
@@ -28,6 +36,12 @@ TYPE_STYLES = {
     "chore": "bold blue",
     "epic": "bold magenta",
     "story": "bold green",
+}
+TYPE_SHORT = {
+    "milestone": "mile",
+    "feature": "feat",
+    "task": "task",
+    "epic": "epic",
 }
 PRIORITY_STYLES = {
     "high": "bold red",
@@ -53,6 +67,67 @@ PRIORITY_SHORT = {
     "normal": "P1",
     "low": "P2",
 }
+DETAIL_HINT_BREAKPOINT = 120
+SELECTED_ROW_STYLE = "bold black on bright_white"
+SELECTED_COLUMN_STYLE = "bold black on cyan"
+
+
+class StatusModal(ModalScreen[None]):
+    CSS = """
+    StatusModal {
+        align: center middle;
+    }
+
+    #statuses {
+        width: 56;
+        height: auto;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    """
+
+    STATUS_KEYS = [
+        ("1", "draft"),
+        ("2", "todo"),
+        ("3", "in-progress"),
+        ("4", "completed"),
+        ("5", "scrapped"),
+    ]
+
+    BINDINGS = [
+        *(Binding(key, f"toggle_status('{status}')", status.title(), show=False) for key, status in STATUS_KEYS),
+        Binding("escape", "dismiss", "Close", show=False),
+        Binding("s", "dismiss", "Close", show=False),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Static(self._render_statuses(), id="statuses")
+
+    def action_toggle_status(self, status: str) -> None:
+        app = self.app
+        if status in app.visible_statuses and len(app.visible_statuses) > 1:
+            app.visible_statuses.remove(status)
+        else:
+            app.visible_statuses.add(status)
+        app._invalidate_cache()
+        app._clamp_selection()
+        app.render_all()
+        self.query_one("#statuses", Static).update(self._render_statuses())
+
+    def action_dismiss(self) -> None:
+        self.dismiss()
+
+    def _render_statuses(self) -> Text:
+        text = Text()
+        text.append("Statuses\n\n", style="bold")
+        text.append("Toggle statuses with 1-5. Esc closes.\n\n", style="dim")
+        for key, status in self.STATUS_KEYS:
+            enabled = status in self.app.visible_statuses
+            text.append(f"{key} ", style="bold cyan")
+            text.append("[x] " if enabled else "[ ] ", style="green" if enabled else "dim")
+            text.append(status + "\n", style=STATUS_STYLES.get(status, "dim") if enabled else "dim")
+        return text
 
 
 class HelpModal(ModalScreen[None]):
@@ -78,6 +153,48 @@ class HelpModal(ModalScreen[None]):
 
     def compose(self) -> ComposeResult:
         yield Static(_help_text(), id="help")
+
+    def action_dismiss(self) -> None:
+        self.dismiss()
+
+
+class DetailModal(ModalScreen[None]):
+    CSS = """
+    DetailModal {
+        align: center middle;
+    }
+
+    #detail-modal {
+        width: 96;
+        height: 85%;
+        max-width: 96%;
+        border: thick $secondary;
+        background: $surface;
+    }
+
+    #detail-modal-body {
+        height: 1fr;
+        overflow-y: auto;
+        padding: 1 2;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "dismiss", "Close", show=False),
+        Binding("enter", "dismiss", "Close", show=False),
+        Binding("q", "dismiss", "Close", show=False),
+    ]
+
+    def __init__(self, detail_renderable) -> None:
+        super().__init__()
+        self.detail_renderable = detail_renderable
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="detail-modal-body"):
+            yield Static(self.detail_renderable, id="detail-modal")
+
+    def on_mount(self) -> None:
+        self.query_one("#detail-modal-body", VerticalScroll).focus()
 
     def action_dismiss(self) -> None:
         self.dismiss()
@@ -154,12 +271,14 @@ class TicketTui(App):
         width: 62%;
         border: solid $primary;
         padding: 0 1;
+        overflow-y: auto;
     }
 
     #detail {
         width: 38%;
         border: solid $secondary;
         padding: 0 1;
+        overflow-y: auto;
     }
     """
 
@@ -172,6 +291,7 @@ class TicketTui(App):
         Binding("y", "copy_id", "Copy ID", show=True),
         Binding("e", "edit_ticket", "Edit", show=True),
         Binding("c", "columns", "Columns", show=True),
+        Binding("s", "statuses", "Statuses", show=True),
         Binding("question_mark", "help", "Help", show=True, priority=True),
         Binding("enter", "open_detail", "Detail", show=True),
         Binding("up", "move_up", "Up", show=False),
@@ -193,8 +313,10 @@ class TicketTui(App):
         self.kanban_column = 0
         self.kanban_index = 0
         self.visible_kanban_columns: Set[str] = set(KANBAN_COLUMNS)
-        self.detail_id: Optional[str] = None
+        self.visible_statuses: Set[str] = set(VALID_STATUSES)
         self.status_message = ""
+        self._tree_rows_cache = None
+        self._kanban_columns_cache = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -219,6 +341,7 @@ class TicketTui(App):
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self.query = event.value
+        self._invalidate_cache()
         self._clamp_selection()
         self.render_all()
 
@@ -239,6 +362,7 @@ class TicketTui(App):
         search = self.query_one("#search", Input)
         search.value = ""
         self.screen.set_focus(None)
+        self._invalidate_cache()
         self._clamp_selection()
         self.render_all()
 
@@ -246,6 +370,7 @@ class TicketTui(App):
         selected = self.selected_ticket_id()
         self.graph = load_graph(self.ticket_dir)
         self.expanded_ids = all_expanded_ids(self.graph)
+        self._invalidate_cache()
         if selected in self.graph.tickets:
             self._select_ticket(selected)
         else:
@@ -255,6 +380,7 @@ class TicketTui(App):
 
     def action_toggle_done(self) -> None:
         self.hide_done = not self.hide_done
+        self._invalidate_cache()
         self._clamp_selection()
         self.render_all()
 
@@ -296,9 +422,14 @@ class TicketTui(App):
     def action_columns(self) -> None:
         self.push_screen(ColumnsModal())
 
+    def action_statuses(self) -> None:
+        self.push_screen(StatusModal())
+
     def action_open_detail(self) -> None:
-        self.detail_id = self.selected_ticket_id()
-        self.render_all()
+        detail = self._render_detail_modal_content()
+        if detail is None:
+            return
+        self.push_screen(DetailModal(detail))
 
     def action_move_up(self) -> None:
         if self.mode == "tree":
@@ -320,9 +451,9 @@ class TicketTui(App):
             ticket_id = self.selected_ticket_id()
             if ticket_id and ticket_id in self.expanded_ids:
                 self.expanded_ids.remove(ticket_id)
+                self._invalidate_cache()
         else:
-            self.kanban_column = max(0, self.kanban_column - 1)
-            self._clamp_selection()
+            self._move_kanban_column(-1)
         self.render_all()
 
     def action_move_right(self) -> None:
@@ -330,9 +461,9 @@ class TicketTui(App):
             ticket_id = self.selected_ticket_id()
             if ticket_id and self.graph.children.get(ticket_id):
                 self.expanded_ids.add(ticket_id)
+                self._invalidate_cache()
         else:
-            self.kanban_column = min(len(self._visible_kanban_columns()) - 1, self.kanban_column + 1)
-            self._clamp_selection()
+            self._move_kanban_column(1)
         self.render_all()
 
     def action_toggle_tree_node(self) -> None:
@@ -345,6 +476,7 @@ class TicketTui(App):
             self.expanded_ids.remove(ticket_id)
         else:
             self.expanded_ids.add(ticket_id)
+        self._invalidate_cache()
         self.render_all()
 
     def selected_ticket_id(self) -> Optional[str]:
@@ -354,15 +486,19 @@ class TicketTui(App):
                 return None
             return rows[self.tree_index][0]
 
-        column = self._current_kanban_column()
-        if not column:
+        location = self._selected_kanban_location()
+        if location is None:
             return None
-        return column[self.kanban_index]
+        column_index, row_index = location
+        column = self._kanban_columns()[self._visible_kanban_columns()[column_index]]
+        return column[row_index]
 
     def render_all(self) -> None:
         main, detail = self._content_widgets()
+        self._apply_layout_mode(main, detail)
         main.update(self._render_main())
         detail.update(self._render_detail())
+        self._sync_scroll()
 
     def _content_widgets(self):
         try:
@@ -382,6 +518,9 @@ class TicketTui(App):
         heading = Text(self.mode.upper(), style="bold")
         if self.hide_done:
             heading.append(" | hide done", style="yellow")
+        if self.visible_statuses != VALID_STATUSES:
+            heading.append(" | status: ", style="dim")
+            heading.append(", ".join(self._visible_status_labels()), style="bold magenta")
         if self.query:
             heading.append(" | search: ", style="dim")
             heading.append(self.query, style="bold cyan")
@@ -404,8 +543,8 @@ class TicketTui(App):
         for index, (ticket_id, depth, has_children, expanded) in enumerate(rows):
             ticket = self.graph.ticket(ticket_id)
             line = Text()
-            selected = ">" if index == self.tree_index else " "
-            line.append(selected + " ", style="reverse" if index == self.tree_index else "")
+            is_selected = index == self.tree_index
+            line.append(">> " if is_selected else "   ")
             line.append(self._tree_prefix(rows, index), style="dim")
             if has_children:
                 marker = "v" if expanded else ">"
@@ -413,6 +552,8 @@ class TicketTui(App):
                 marker = "-"
             line.append(marker + " ", style="bold")
             line.append(_ticket_label(ticket))
+            if is_selected:
+                line.stylize(SELECTED_ROW_STYLE)
             lines.append(line)
         return Group(*lines)
 
@@ -427,7 +568,14 @@ class TicketTui(App):
         for _column in visible_columns:
             table.add_column(ratio=1)
         table.add_row(
-            *[Text(column, style="bold underline", justify="center") for column in visible_columns]
+            *[
+                Text(
+                    column,
+                    style=SELECTED_COLUMN_STYLE if self._selected_kanban_column_index() == column_index else "bold underline",
+                    justify="center",
+                )
+                for column_index, column in enumerate(visible_columns)
+            ]
         )
 
         for row_index in range(visible_max_rows):
@@ -435,20 +583,43 @@ class TicketTui(App):
             for column_index, column in enumerate(visible_columns):
                 ids = columns[column]
                 if row_index >= len(ids):
-                    cells.append(Text(""))
+                    cells.append(Text("   "))
                     continue
                 ticket = self.graph.ticket(ids[row_index])
-                cell = Text("> " if column_index == self.kanban_column and row_index == self.kanban_index else "  ")
+                is_selected = (
+                    column_index == self._selected_kanban_column_index()
+                    and row_index == self._selected_kanban_row_index()
+                )
+                cell = Text(">> " if is_selected else "   ")
                 cell.append(_ticket_label(ticket))
+                if is_selected:
+                    cell.stylize(SELECTED_ROW_STYLE)
                 cells.append(cell)
             table.add_row(*cells)
         return table
 
     def _render_detail(self):
-        ticket_id = self.detail_id or self.selected_ticket_id()
+        if self.mode == "kanban":
+            return ""
+        if self._is_narrow_layout():
+            return "DETAIL\n\npress enter to show"
+
+        ticket_id = self.selected_ticket_id()
         if not ticket_id or ticket_id not in self.graph.tickets:
             return "DETAIL\n\nNo ticket selected"
 
+        preview = self._build_detail_renderable(ticket_id)
+        hint = Text()
+        hint.append("\nOpen with Enter for scrollable detail.", style="dim")
+        return Group(preview, hint)
+
+    def _render_detail_modal_content(self):
+        ticket_id = self.selected_ticket_id()
+        if not ticket_id or ticket_id not in self.graph.tickets:
+            return None
+        return self._build_detail_renderable(ticket_id)
+
+    def _build_detail_renderable(self, ticket_id: str):
         ticket = self.graph.ticket(ticket_id)
         lines: List[Text] = [Text("DETAIL", style="bold"), Text("")]
         lines.append(_metadata_line("ID", ticket.id, "bold cyan"))
@@ -470,13 +641,32 @@ class TicketTui(App):
         return Group(*lines)
 
     def _tree_rows(self):
-        return tree_rows(self.graph, self.query, self.hide_done, self.expanded_ids)
+        if self._tree_rows_cache is None:
+            self._tree_rows_cache = tree_rows(
+                self.graph,
+                self.query,
+                self.hide_done,
+                self.expanded_ids,
+                self.visible_statuses,
+            )
+        return self._tree_rows_cache
 
     def _kanban_columns(self) -> Dict[str, List[str]]:
-        return kanban_columns(self.graph, self.query, self.hide_done)
+        if self._kanban_columns_cache is None:
+            self._kanban_columns_cache = kanban_columns(
+                self.graph,
+                self.query,
+                self.hide_done,
+                self.visible_statuses,
+            )
+        return self._kanban_columns_cache
 
     def _current_kanban_column(self) -> List[str]:
-        return self._kanban_columns()[self._visible_kanban_columns()[self.kanban_column]]
+        location = self._selected_kanban_location()
+        if location is None:
+            return []
+        column_index, _row_index = location
+        return self._kanban_columns()[self._visible_kanban_columns()[column_index]]
 
     def _visible_kanban_columns(self) -> List[str]:
         columns = [column for column in KANBAN_COLUMNS if column in self.visible_kanban_columns]
@@ -487,8 +677,11 @@ class TicketTui(App):
         self.tree_index = min(self.tree_index, max(0, len(rows) - 1))
 
         self.kanban_column = min(max(0, self.kanban_column), len(self._visible_kanban_columns()) - 1)
-        current = self._current_kanban_column()
-        self.kanban_index = min(self.kanban_index, max(0, len(current) - 1))
+        location = self._selected_kanban_location(prefer_row=self.kanban_index)
+        if location is not None:
+            self.kanban_column, self.kanban_index = location
+        else:
+            self.kanban_index = 0
 
     def _select_ticket(self, ticket_id: str) -> None:
         rows = self._tree_rows()
@@ -503,6 +696,74 @@ class TicketTui(App):
                 self.kanban_column = column_index
                 self.kanban_index = columns[column].index(ticket_id)
                 break
+
+    def _move_kanban_column(self, direction: int) -> None:
+        visible_columns = self._visible_kanban_columns()
+        columns = self._kanban_columns()
+        start = self._selected_kanban_column_index()
+        index = start + direction
+        while 0 <= index < len(visible_columns):
+            if columns[visible_columns[index]]:
+                self.kanban_column = index
+                self.kanban_index = min(self.kanban_index, len(columns[visible_columns[index]]) - 1)
+                return
+            index += direction
+
+    def _invalidate_cache(self) -> None:
+        self._tree_rows_cache = None
+        self._kanban_columns_cache = None
+
+    def _visible_status_labels(self) -> List[str]:
+        return [status for status in ("draft", "todo", "in-progress", "completed", "scrapped") if status in self.visible_statuses]
+
+    def _is_narrow_layout(self) -> bool:
+        return self.size.width < DETAIL_HINT_BREAKPOINT
+
+    def _sync_scroll(self) -> None:
+        main, _detail = self._content_widgets()
+        if self.mode == "tree":
+            main.scroll_to(y=max(0, self.tree_index), animate=False, force=True, immediate=True)
+        else:
+            main.scroll_to(y=max(0, self.kanban_index), animate=False, force=True, immediate=True)
+
+    def _apply_layout_mode(self, main: Static, detail: Static) -> None:
+        if self.mode == "kanban":
+            main.styles.width = "100%"
+            detail.styles.display = "none"
+        else:
+            main.styles.width = "62%"
+            detail.styles.display = "block"
+
+    def _selected_kanban_location(self, prefer_row: Optional[int] = None) -> Optional[Tuple[int, int]]:
+        columns = self._kanban_columns()
+        visible_columns = self._visible_kanban_columns()
+        if not visible_columns:
+            return None
+
+        preferred_row = self.kanban_index if prefer_row is None else prefer_row
+        selected_column = min(max(0, self.kanban_column), len(visible_columns) - 1)
+        if columns[visible_columns[selected_column]]:
+            row_index = min(preferred_row, len(columns[visible_columns[selected_column]]) - 1)
+            return selected_column, row_index
+
+        for distance in range(1, len(visible_columns)):
+            left = selected_column - distance
+            if left >= 0 and columns[visible_columns[left]]:
+                row_index = min(preferred_row, len(columns[visible_columns[left]]) - 1)
+                return left, row_index
+            right = selected_column + distance
+            if right < len(visible_columns) and columns[visible_columns[right]]:
+                row_index = min(preferred_row, len(columns[visible_columns[right]]) - 1)
+                return right, row_index
+        return None
+
+    def _selected_kanban_column_index(self) -> int:
+        location = self._selected_kanban_location()
+        return self.kanban_column if location is None else location[0]
+
+    def _selected_kanban_row_index(self) -> int:
+        location = self._selected_kanban_location()
+        return self.kanban_index if location is None else location[1]
 
     def _tree_prefix(self, rows, index: int) -> str:
         _ticket_id, depth, _has_children, _expanded = rows[index]
@@ -534,7 +795,8 @@ class TicketTui(App):
 
 def _ticket_label(ticket: Ticket) -> Text:
     text = Text()
-    _chip(text, ticket.type or "task", _type_style(ticket))
+    ticket_type = (ticket.type or "task").lower()
+    _chip(text, TYPE_SHORT.get(ticket_type, ticket_type[:4]), _type_style(ticket))
     _chip(text, PRIORITY_SHORT.get((ticket.priority or "normal").lower(), "P1"), _priority_style(ticket))
     _chip(text, STATUS_SHORT.get(ticket.status, "?"), STATUS_STYLES.get(ticket.status, ""))
     text.append(ticket.title, style="white")
@@ -575,11 +837,12 @@ def _help_text() -> Text:
         ("r", "refresh tickets"),
         ("d", "toggle hide done"),
         ("c", "choose visible kanban columns"),
+        ("s", "filter visible statuses"),
         ("y", "copy selected ticket ID"),
         ("e", "edit selected ticket in $EDITOR"),
-        ("Enter", "show selected ticket detail"),
+        ("Enter", "open selected ticket detail modal"),
         ("Up / Down", "move selection"),
-        ("Left / Right", "collapse/expand tree or move kanban columns"),
+        ("Left / Right", "collapse/expand tree or move across non-empty kanban columns"),
         ("Space", "toggle selected tree subtree"),
     ]
     for key, description in rows:
